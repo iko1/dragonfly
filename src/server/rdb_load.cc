@@ -174,6 +174,45 @@ int ziplistPairsConvertAndValidateIntegrity(unsigned char* zl, size_t size, unsi
 
 }  // namespace
 
+class RdbLoader::OpaqueObjVisitor {
+ public:
+  OpaqueObjVisitor(PrimeValue* pv) : pv_(pv) {
+  }
+
+  void operator()(robj* o) {
+    pv_->ImportRObj(o);
+  }
+
+  void operator()(long long val) {
+    pv_->SetInt(val);
+  }
+
+  void operator()(std::string_view str) {
+    pv_->SetString(str);
+  }
+
+  void operator()(const LzfString& lzfstr);
+
+  std::error_code ec() const {
+    return ec_;
+  }
+
+ private:
+  std::error_code ec_;
+  PrimeValue* pv_;
+};
+
+void RdbLoader::OpaqueObjVisitor::operator()(const LzfString& lzfstr) {
+  string tmp(lzfstr.uncompressed_len, '\0');
+  if (lzf_decompress(lzfstr.compressed_blob.data(), lzfstr.compressed_blob.size(), tmp.data(),
+                     tmp.size()) == 0) {
+    LOG(ERROR) << "Invalid LZF compressed string";
+    ec_ = RdbError(errc::rdb_file_corrupted);
+  } else {
+    pv_->SetString(tmp);
+  }
+}
+
 struct RdbLoader::ObjSettings {
   long long now;           // current epoch time in ms.
   int64_t expiretime = 0;  // expire epoch time in ms
@@ -260,6 +299,8 @@ error_code RdbLoader::Load(io::Source* src) {
   size_t keys_loaded = 0;
 
   while (1) {
+    if (stop_early_.load(memory_order_relaxed))
+      break;
     /* Read type. */
     SET_OR_RETURN(FetchType(), type);
 
@@ -352,6 +393,11 @@ error_code RdbLoader::Load(io::Source* src) {
     RETURN_ON_ERR(LoadKeyValPair(type, &settings));
     settings.Reset();
   }  // main load loop
+
+  if (stop_early_) {
+    lock_guard lk(mu_);
+    return ec_;
+  }
 
   /* Verify the checksum if RDB version is >= 5 */
   RETURN_ON_ERR(VerifyChecksum());
@@ -593,7 +639,12 @@ void RdbLoader::FlushShardAsync(ShardId sid) {
   if (out_buf.empty())
     return;
 
-  auto cb = [indx = this->cur_db_index_, vec = std::move(out_buf)] { LoadItemsBuffer(indx, vec); };
+  ItemsBuf* ib = new ItemsBuf{std::move(out_buf)};
+  auto cb = [indx = this->cur_db_index_, ib, this] {
+    this->LoadItemsBuffer(indx, *ib);
+    delete ib;
+  };
+
   shard_set->Add(sid, std::move(cb));
 }
 
@@ -601,7 +652,18 @@ void RdbLoader::LoadItemsBuffer(DbIndex db_ind, const ItemsBuf& ib) {
   DbSlice& db_slice = EngineShard::tlocal()->db_slice();
   for (const auto& item : ib) {
     std::string_view key{item.key, sdslen(item.key)};
-    auto [it, added] = db_slice.AddOrFind(db_ind, key, PrimeValue{item.val}, item.expire_ms);
+    PrimeValue pv;
+    OpaqueObjVisitor visitor(&pv);
+    std::visit(visitor, item.val);
+
+    if (visitor.ec()) {
+      lock_guard lk(mu_);
+      ec_ = visitor.ec();
+      stop_early_ = true;
+      break;
+    }
+
+    auto [it, added] = db_slice.AddOrFind(db_ind, key, std::move(pv), item.expire_ms);
 
     if (!added) {
       LOG(WARNING) << "RDB has duplicated key '" << key << "' in DB " << db_ind;
@@ -622,7 +684,7 @@ auto RdbLoader::FetchGenericString(int flags) -> io::Result<OpaqueBuf> {
       case RDB_ENC_INT8:
       case RDB_ENC_INT16:
       case RDB_ENC_INT32:
-        return FetchIntegerObject(len, flags, NULL);
+        return FetchIntegerObject(len, flags);
       case RDB_ENC_LZF:
         return FetchLzfStringObject(flags);
       default:
@@ -717,8 +779,7 @@ auto RdbLoader::FetchLzfStringObject(int flags) -> io::Result<OpaqueBuf> {
   return make_pair(createObject(OBJ_STRING, val), len);
 }
 
-auto RdbLoader::FetchIntegerObject(int enctype, int flags, size_t* lenptr)
-    -> io::Result<OpaqueBuf> {
+auto RdbLoader::FetchIntegerObject(int enctype, int flags) -> io::Result<OpaqueBuf> {
   bool plain = (flags & RDB_LOAD_PLAIN) != 0;
   bool sds = (flags & RDB_LOAD_SDS) != 0;
   bool encode = (flags & RDB_LOAD_ENC) != 0;
@@ -737,8 +798,6 @@ auto RdbLoader::FetchIntegerObject(int enctype, int flags, size_t* lenptr)
   if (plain || sds) {
     char buf[LONG_STR_SIZE], *p;
     int len = ll2string(buf, sizeof(buf), val);
-    if (lenptr)
-      *lenptr = len;
     p = plain ? (char*)zmalloc(len) : sdsnewlen(SDS_NOINIT, len);
     memcpy(p, buf, len);
     return make_pair(p, len);
@@ -801,17 +860,13 @@ auto RdbLoader::ReadKey() -> io::Result<sds> {
   return res.get_unexpected();
 }
 
-io::Result<robj*> RdbLoader::ReadObj(int rdbtype) {
+auto RdbLoader::ReadObj(int rdbtype) -> io::Result<OpaqueObj> {
   io::Result<robj*> res_obj = nullptr;
-  io::Result<OpaqueBuf> fetch_res;
 
   switch (rdbtype) {
     case RDB_TYPE_STRING:
       /* Read string value */
-      fetch_res = FetchGenericString(RDB_LOAD_NONE);
-      if (!fetch_res)
-        return fetch_res.get_unexpected();
-      res_obj = (robj*)fetch_res->first;
+      return ReadStringObj();
       break;
     case RDB_TYPE_SET:
       res_obj = ReadSet();
@@ -844,6 +899,71 @@ io::Result<robj*> RdbLoader::ReadObj(int rdbtype) {
   }
 
   return res_obj;
+}
+
+auto RdbLoader::ReadStringObj() -> io::Result<OpaqueObj> {
+  bool isencoded;
+  size_t len;
+
+  SET_OR_UNEXPECT(LoadLen(&isencoded), len);
+
+  if (isencoded) {
+    switch (len) {
+      case RDB_ENC_INT8:
+      case RDB_ENC_INT16:
+      case RDB_ENC_INT32:
+        return ReadIntObj(len);
+      case RDB_ENC_LZF:
+        return ReadLzf();
+      default:
+        LOG(ERROR) << "Unknown RDB string encoding " << len;
+        return Unexpected(errc::rdb_file_corrupted);
+    }
+  }
+
+  string res(len, '\0');
+  error_code ec = FetchBuf(len, res.data());
+  if (ec) {
+    return make_unexpected(ec);
+  }
+  return res;
+}
+
+io::Result<long long> RdbLoader::ReadIntObj(int enctype) {
+  long long val;
+
+  if (enctype == RDB_ENC_INT8) {
+    SET_OR_UNEXPECT(FetchInt<int8_t>(), val);
+  } else if (enctype == RDB_ENC_INT16) {
+    SET_OR_UNEXPECT(FetchInt<uint16_t>(), val);
+  } else if (enctype == RDB_ENC_INT32) {
+    SET_OR_UNEXPECT(FetchInt<uint32_t>(), val);
+  } else {
+    return Unexpected(errc::invalid_encoding);
+  }
+  return val;
+}
+
+auto RdbLoader::ReadLzf() -> io::Result<LzfString> {
+  uint64_t clen;
+  LzfString res;
+
+  SET_OR_UNEXPECT(LoadLen(NULL), clen);
+  SET_OR_UNEXPECT(LoadLen(NULL), res.uncompressed_len);
+
+  if (res.uncompressed_len > 1ULL << 29) {
+    LOG(ERROR) << "Uncompressed length is too big " << res.uncompressed_len;
+    return Unexpected(errc::rdb_file_corrupted);
+  }
+
+  res.compressed_blob.resize(clen);
+  /* Load the compressed representation and uncompress it to target. */
+  error_code ec = FetchBuf(clen, res.compressed_blob.data());
+  if (ec) {
+    return make_unexpected(ec);
+  }
+
+  return res;
 }
 
 io::Result<robj*> RdbLoader::ReadSet() {
@@ -1449,13 +1569,18 @@ void RdbLoader::ResizeDb(size_t key_num, size_t expire_num) {
 error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
   /* Read key */
   sds key;
-  robj* val;
+  OpaqueObj val;
 
+  // We free key in LoadItemsBuffer.
   SET_OR_RETURN(ReadKey(), key);
 
   auto key_cleanup = absl::MakeCleanup([key] { sdsfree(key); });
+  io::Result<OpaqueObj> io_res = ReadObj(type);
 
-  SET_OR_RETURN(ReadObj(type), val);
+  if (!io_res) {
+    return io_res.get_unexpected().value();
+  }
+  val = std::move(io_res.value());
 
   /* Check if the key already expired. This function is used when loading
    * an RDB file from disk, either at startup, or when an RDB was
@@ -1468,7 +1593,7 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
   // TODO: check rdbflags&RDBFLAGS_AOF_PREAMBLE logic in rdb.c
   bool should_expire = settings->has_expired;  // TODO: to implement
   if (should_expire) {
-    decrRefCount(val);
+    // decrRefCount(val);
   } else {
     std::move(key_cleanup).Cancel();
 
@@ -1477,7 +1602,7 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
     uint64_t expire_at_ms = settings->expiretime;
 
     auto& out_buf = shard_buf_[sid];
-    out_buf.emplace_back(Item{key, val, expire_at_ms});
+    out_buf.emplace_back(Item{key, std::move(val), expire_at_ms});
 
     constexpr size_t kBufSize = 128;
     if (out_buf.size() >= kBufSize) {
