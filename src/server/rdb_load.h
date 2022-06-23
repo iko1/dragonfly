@@ -48,8 +48,22 @@ class RdbLoader {
     uint64_t uncompressed_len;
   };
 
-  using OpaqueObj = std::variant<long long, robj*, std::string, LzfString>;
-  class OpaqueObjVisitor;
+  struct RawStructure;
+
+  using RdbTypeSet = std::variant<long long, robj*, base::PODArray<char>, LzfString,
+                                  std::unique_ptr<RawStructure>>;
+  struct OpaqueObj {
+    RdbTypeSet obj;
+    int rdb_type;
+
+    size_t str_len() const;
+  };
+
+  struct RawStructure {
+    std::vector<RdbTypeSet> arr;
+  };
+
+  class OpaqueObjLoader;
 
   struct Item {
     sds key;
@@ -83,12 +97,12 @@ class RdbLoader {
   ::io::Result<sds> ReadKey();
 
   ::io::Result<OpaqueObj> ReadObj(int rdbtype);
-  ::io::Result<OpaqueObj> ReadStringObj();
+  ::io::Result<RdbTypeSet> ReadStringObj();
   ::io::Result<long long> ReadIntObj(int encoding);
   ::io::Result<LzfString> ReadLzf();
 
-  ::io::Result<robj*> ReadSet();
-  ::io::Result<robj*> ReadIntSet();
+  ::io::Result<OpaqueObj> ReadSet();
+  ::io::Result<OpaqueObj> ReadIntSet();
   ::io::Result<robj*> ReadHZiplist();
   ::io::Result<robj*> ReadHSet();
   ::io::Result<robj*> ReadZSet(int rdbtype);

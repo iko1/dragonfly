@@ -174,9 +174,9 @@ int ziplistPairsConvertAndValidateIntegrity(unsigned char* zl, size_t size, unsi
 
 }  // namespace
 
-class RdbLoader::OpaqueObjVisitor {
+class RdbLoader::OpaqueObjLoader {
  public:
-  OpaqueObjVisitor(PrimeValue* pv) : pv_(pv) {
+  OpaqueObjLoader(int rdb_type, PrimeValue* pv) : rdb_type_(rdb_type), pv_(pv) {
   }
 
   void operator()(robj* o) {
@@ -187,30 +187,179 @@ class RdbLoader::OpaqueObjVisitor {
     pv_->SetInt(val);
   }
 
-  void operator()(std::string_view str) {
-    pv_->SetString(str);
-  }
+  void operator()(const base::PODArray<char>& str);
 
   void operator()(const LzfString& lzfstr);
+  void operator()(const unique_ptr<RawStructure>& ptr);
 
   std::error_code ec() const {
     return ec_;
   }
 
  private:
+  void CreateSet(const RawStructure* rs);
+  void HandleBlob(string_view blob);
+
+  sds ToSds(const RdbTypeSet& obj);
+
   std::error_code ec_;
+  int rdb_type_;
   PrimeValue* pv_;
 };
 
-void RdbLoader::OpaqueObjVisitor::operator()(const LzfString& lzfstr) {
+void RdbLoader::OpaqueObjLoader::operator()(const base::PODArray<char>& str) {
+  string_view sv(str.data(), str.size());
+  HandleBlob(sv);
+}
+
+void RdbLoader::OpaqueObjLoader::operator()(const LzfString& lzfstr) {
   string tmp(lzfstr.uncompressed_len, '\0');
   if (lzf_decompress(lzfstr.compressed_blob.data(), lzfstr.compressed_blob.size(), tmp.data(),
                      tmp.size()) == 0) {
     LOG(ERROR) << "Invalid LZF compressed string";
     ec_ = RdbError(errc::rdb_file_corrupted);
-  } else {
-    pv_->SetString(tmp);
+    return;
   }
+  HandleBlob(tmp);
+}
+
+void RdbLoader::OpaqueObjLoader::operator()(const unique_ptr<RawStructure>& ptr) {
+  switch (rdb_type_) {
+    case RDB_TYPE_SET:
+      CreateSet(ptr.get());
+      break;
+    default:
+      LOG(FATAL) << "Unsupported rdb type " << rdb_type_;
+  }
+}
+
+void RdbLoader::OpaqueObjLoader::CreateSet(const RawStructure* rs) {
+  size_t len = rs->arr.size();
+
+  bool is_intset = true;
+  if (len <= SetFamily::MaxIntsetEntries()) {
+    for (size_t i = 0; i < len; i++) {
+      if (!holds_alternative<long long>(rs->arr[i])) {
+        is_intset = false;
+        break;
+      }
+    }
+  } else {
+    /* Use a regular set when there are too many entries. */
+
+    is_intset = false;
+  }
+
+  robj* res = nullptr;
+  sds sdsele = nullptr;
+
+  auto cleanup = absl::MakeCleanup([&] {
+    if (sdsele)
+      sdsfree(sdsele);
+    decrRefCount(res);
+  });
+
+  if (is_intset) {
+    res = createIntsetObject();
+    long long llval;
+    for (size_t i = 0; i < len; i++) {
+      llval = get<long long>(rs->arr[i]);
+      uint8_t success;
+      res->ptr = intsetAdd((intset*)res->ptr, llval, &success);
+      if (!success) {
+        LOG(ERROR) << "Duplicate set members detected";
+        ec_ = RdbError(errc::duplicate_key);
+        return;
+      }
+    }
+  } else {
+    res = createSetObject();
+    /* It's faster to expand the dict to the right size asap in order
+     * to avoid rehashing */
+    if (len > DICT_HT_INITIAL_SIZE && dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
+      LOG(ERROR) << "OOM in dictTryExpand " << len;
+      ec_ = RdbError(errc::out_of_memory);
+      return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+      sdsele = ToSds(rs->arr[i]);
+      if (!sdsele)
+        return;
+
+      if (dictAdd((dict*)res->ptr, sdsele, NULL) != DICT_OK) {
+        LOG(ERROR) << "Duplicate set members detected";
+        ec_ = RdbError(errc::duplicate_key);
+        return;
+      }
+    }
+  }
+
+  pv_->ImportRObj(res);
+  std::move(cleanup).Cancel();
+}
+
+void RdbLoader::OpaqueObjLoader::HandleBlob(string_view blob) {
+  if (rdb_type_ == RDB_TYPE_STRING) {
+    pv_->SetString(blob);
+  } else if (rdb_type_ == RDB_TYPE_SET_INTSET) {
+    if (!intsetValidateIntegrity((const uint8_t*)blob.data(), blob.size(), 0)) {
+      LOG(ERROR) << "Intset integrity check failed.";
+      ec_ = RdbError(errc::rdb_file_corrupted);
+      return;
+    }
+
+    const intset* is = (const intset*)blob.data();
+    robj* res = nullptr;
+    unsigned len = intsetLen(is);
+    if (len > SetFamily::MaxIntsetEntries()) {
+      res = createSetObject();
+      if (len > DICT_HT_INITIAL_SIZE && dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
+        LOG(ERROR) << "OOM in dictTryExpand " << len;
+        decrRefCount(res);
+        ec_ = RdbError(errc::out_of_memory);
+        return;
+      }
+
+      SetFamily::ConvertTo(is, (dict*)res->ptr);
+    } else {
+      intset* mine = (intset*)zmalloc(blob.size());
+      memcpy(mine, blob.data(), blob.size());
+      res = createObject(OBJ_SET, mine);
+      res->encoding = OBJ_ENCODING_INTSET;
+    }
+    pv_->ImportRObj(res);
+  } else {
+    LOG(FATAL) << "Unsupported rdb type " << rdb_type_;
+  }
+}
+
+sds RdbLoader::OpaqueObjLoader::ToSds(const RdbTypeSet& obj) {
+  if (holds_alternative<long long>(obj)) {
+    return sdsfromlonglong(get<long long>(obj));
+  }
+
+  const base::PODArray<char>* ch_arr = get_if<base::PODArray<char>>(&obj);
+  if (ch_arr) {
+    return sdsnewlen(ch_arr->data(), ch_arr->size());
+  }
+
+  const LzfString* lzf = get_if<LzfString>(&obj);
+  if (lzf) {
+    sds res = sdsnewlen(NULL, lzf->uncompressed_len);
+    if (lzf_decompress(lzf->compressed_blob.data(), lzf->compressed_blob.size(), res,
+                       lzf->uncompressed_len) == 0) {
+      LOG(ERROR) << "Invalid LZF compressed string";
+      ec_ = RdbError(errc::rdb_file_corrupted);
+      sdsfree(res);
+
+      return nullptr;
+    }
+    return res;
+  }
+
+  LOG(FATAL) << "Unexpected variant";
+  return nullptr;
 }
 
 struct RdbLoader::ObjSettings {
@@ -653,8 +802,8 @@ void RdbLoader::LoadItemsBuffer(DbIndex db_ind, const ItemsBuf& ib) {
   for (const auto& item : ib) {
     std::string_view key{item.key, sdslen(item.key)};
     PrimeValue pv;
-    OpaqueObjVisitor visitor(&pv);
-    std::visit(visitor, item.val);
+    OpaqueObjLoader visitor(item.val.rdb_type, &pv);
+    std::visit(visitor, item.val.obj);
 
     if (visitor.ec()) {
       lock_guard lk(mu_);
@@ -864,16 +1013,17 @@ auto RdbLoader::ReadObj(int rdbtype) -> io::Result<OpaqueObj> {
   io::Result<robj*> res_obj = nullptr;
 
   switch (rdbtype) {
-    case RDB_TYPE_STRING:
+    case RDB_TYPE_STRING: {
       /* Read string value */
-      return ReadStringObj();
-      break;
+      auto fetch = ReadStringObj();
+      if (!fetch)
+        return make_unexpected(fetch.error());
+      return OpaqueObj{std::move(*fetch), RDB_TYPE_STRING};
+    }
     case RDB_TYPE_SET:
-      res_obj = ReadSet();
-      break;
+      return ReadSet();
     case RDB_TYPE_SET_INTSET:
-      res_obj = ReadIntSet();
-      break;
+      return ReadIntSet();
     case RDB_TYPE_HASH_ZIPLIST:
       res_obj = ReadHZiplist();
       break;
@@ -898,10 +1048,13 @@ auto RdbLoader::ReadObj(int rdbtype) -> io::Result<OpaqueObj> {
       return Unexpected(errc::invalid_encoding);
   }
 
-  return res_obj;
+  if (!res_obj)
+    return make_unexpected(res_obj.error());
+
+  return OpaqueObj{*res_obj, rdbtype};
 }
 
-auto RdbLoader::ReadStringObj() -> io::Result<OpaqueObj> {
+auto RdbLoader::ReadStringObj() -> io::Result<RdbTypeSet> {
   bool isencoded;
   size_t len;
 
@@ -921,12 +1074,14 @@ auto RdbLoader::ReadStringObj() -> io::Result<OpaqueObj> {
     }
   }
 
-  string res(len, '\0');
-  error_code ec = FetchBuf(len, res.data());
+  base::PODArray<char> blob;
+  blob.resize(len);
+  error_code ec = FetchBuf(len, blob.data());
   if (ec) {
     return make_unexpected(ec);
   }
-  return res;
+
+  return blob;
 }
 
 io::Result<long long> RdbLoader::ReadIntObj(int enctype) {
@@ -966,117 +1121,46 @@ auto RdbLoader::ReadLzf() -> io::Result<LzfString> {
   return res;
 }
 
-io::Result<robj*> RdbLoader::ReadSet() {
+auto RdbLoader::ReadSet() -> io::Result<OpaqueObj> {
   size_t len;
   SET_OR_UNEXPECT(LoadLen(NULL), len);
 
   if (len == 0)
     return Unexpected(errc::empty_key);
 
-  robj* res = nullptr;
-  sds sdsele = nullptr;
-
-  auto cleanup = absl::MakeCleanup([&] {
-    if (sdsele)
-      sdsfree(sdsele);
-    decrRefCount(res);
-  });
-
-  /* Use a regular set when there are too many entries. */
-  if (len > SetFamily::MaxIntsetEntries()) {
-    res = createSetObject();
-    /* It's faster to expand the dict to the right size asap in order
-     * to avoid rehashing */
-    if (len > DICT_HT_INITIAL_SIZE && dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
-      LOG(ERROR) << "OOM in dictTryExpand " << len;
-      return Unexpected(errc::out_of_memory);
-    }
-  } else {
-    // TODO: why do we bother creating intset if it was recorded as non intset?
-    res = createIntsetObject();
-  }
-
-  /* Load every single element of the set */
+  unique_ptr<RawStructure> res(new RawStructure);
+  res->arr.resize(len);
   for (size_t i = 0; i < len; i++) {
-    long long llval;
-    io::Result<OpaqueBuf> fetch = FetchGenericString(RDB_LOAD_SDS);
+    io::Result<RdbTypeSet> fetch = ReadStringObj();
     if (!fetch) {
       return make_unexpected(fetch.error());
     }
-    sdsele = (sds)fetch->first;
-
-    if (res->encoding == OBJ_ENCODING_INTSET) {
-      /* Fetch integer value from element. */
-      if (isSdsRepresentableAsLongLong(sdsele, &llval) == C_OK) {
-        uint8_t success;
-        res->ptr = intsetAdd((intset*)res->ptr, llval, &success);
-        if (!success) {
-          LOG(ERROR) << "Duplicate set members detected";
-          return Unexpected(errc::duplicate_key);
-        }
-      } else {
-        dict* ds = dictCreate(&setDictType);
-        if (dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
-          dictRelease(ds);
-          LOG(ERROR) << "OOM in dictTryExpand " << len;
-          return Unexpected(errc::out_of_memory);
-        }
-        SetFamily::ConvertTo((intset*)res->ptr, ds);
-        zfree(res->ptr);
-        res->ptr = ds;
-        res->encoding = OBJ_ENCODING_HT;
-      }
-    }
-
-    /* This will also be called when the set was just converted
-     * to a regular hash table encoded set. */
-    if (res->encoding == OBJ_ENCODING_HT) {
-      if (dictAdd((dict*)res->ptr, sdsele, NULL) != DICT_OK) {
-        LOG(ERROR) << "Duplicate set members detected";
-        return Unexpected(errc::duplicate_key);
-      }
-    } else {
-      sdsfree(sdsele);
-    }
+    res->arr[i] = std::move(fetch.value());
   }
 
-  std::move(cleanup).Cancel();
-
-  return res;
+  return OpaqueObj{std::move(res), RDB_TYPE_SET};
 }
 
-::io::Result<robj*> RdbLoader::ReadIntSet() {
-  OpaqueBuf fetch;
-  SET_OR_UNEXPECT(FetchGenericString(RDB_LOAD_PLAIN), fetch);
-
-  if (fetch.second == 0) {
-    return Unexpected(errc::rdb_file_corrupted);
-  }
-  DCHECK(fetch.first);
-
-  if (!intsetValidateIntegrity((uint8_t*)fetch.first, fetch.second, 0)) {
-    LOG(ERROR) << "Intset integrity check failed.";
-    zfree(fetch.first);
-    return Unexpected(errc::rdb_file_corrupted);
+auto RdbLoader::ReadIntSet() -> io::Result<OpaqueObj> {
+  io::Result<RdbTypeSet> fetch = ReadStringObj();
+  if (!fetch) {
+    return make_unexpected(fetch.error());
   }
 
-  intset* is = (intset*)fetch.first;
-  robj* res;
-  unsigned len = intsetLen(is);
-  if (len > SetFamily::MaxIntsetEntries()) {
-    res = createSetObject();
-    if (len > DICT_HT_INITIAL_SIZE && dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
-      LOG(ERROR) << "OOM in dictTryExpand " << len;
-      decrRefCount(res);
-      return Unexpected(errc::out_of_memory);
-    }
-    SetFamily::ConvertTo(is, (dict*)res->ptr);
-    zfree(is);
+  const LzfString* lzf = get_if<LzfString>(&fetch.value());
+  const base::PODArray<char>* arr = get_if<base::PODArray<char>>(&fetch.value());
+
+  if (lzf) {
+    if (lzf->uncompressed_len == 0 || lzf->compressed_blob.empty())
+      return Unexpected(errc::rdb_file_corrupted);
+  } else if (arr) {
+    if (arr->empty())
+      return Unexpected(errc::rdb_file_corrupted);
   } else {
-    res = createObject(OBJ_SET, is);
-    res->encoding = OBJ_ENCODING_INTSET;
+    return Unexpected(errc::rdb_file_corrupted);
   }
-  return res;
+
+  return OpaqueObj{std::move(*fetch), RDB_TYPE_SET_INTSET};
 }
 
 io::Result<robj*> RdbLoader::ReadHZiplist() {
@@ -1578,7 +1662,8 @@ error_code RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) {
   io::Result<OpaqueObj> io_res = ReadObj(type);
 
   if (!io_res) {
-    return io_res.get_unexpected().value();
+    VLOG(1) << "ReadObj error " << io_res.error() << " for key " << key;
+    return io_res.error();
   }
   val = std::move(io_res.value());
 
