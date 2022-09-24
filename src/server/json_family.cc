@@ -32,6 +32,7 @@ using OptBool = optional<bool>;
 using OptSizeT = optional<size_t>;
 using JsonReplaceCb = function<void(const string&, json&)>;
 using CI = CommandId;
+using StringVector = vector<string>;
 
 namespace {
 
@@ -489,7 +490,65 @@ OpResult<long> OpDel(const OpArgs& op_args, string_view key, string_view path) {
   return total_deletions;
 }
 
+OpResult<vector<StringVector>> OpObjKeys(const OpArgs& op_args, string_view key,
+                                         JsonExpression expression) {
+  OpResult<json> result = GetJson(op_args, key);
+  if (!result) {
+    return result.status();
+  }
+
+  vector<StringVector> vec;
+  auto cb = [&vec](const string_view& path, const json& val) {
+    if (!val.is_object()) {
+      vec.emplace_back();
+      return;
+    }
+
+    auto& current_object = vec.emplace_back();
+    for (const auto& member : val.object_range()) {
+      current_object.emplace_back(member.key());
+    }
+  };
+
+  expression.evaluate(*result, cb);
+  return vec;
+}
+
 }  // namespace
+
+void JsonFamily::ObjKeys(CmdArgList args, ConnectionContext* cntx) {
+  string_view key = ArgS(args, 1);
+  string_view path = ArgS(args, 2);
+
+  error_code ec;
+  JsonExpression expression = jsonpath::make_expression<json>(path, ec);
+
+  if (ec) {
+    VLOG(1) << "Invalid JSONPath syntax: " << ec.message();
+    (*cntx)->SendError(kSyntaxErr);
+    return;
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpObjKeys(t->GetOpArgs(shard), key, move(expression));
+  };
+
+  Transaction* trans = cntx->transaction;
+  OpResult<vector<StringVector>> result = trans->ScheduleSingleHopT(move(cb));
+
+  if (result) {
+    (*cntx)->StartArray(result->size());
+    for (auto& it : *result) {
+      if (it.empty()) {
+        (*cntx)->SendNullArray();
+      } else {
+        (*cntx)->SendStringArr(it);
+      }
+    }
+  } else {
+    (*cntx)->SendError(result.status());
+  }
+}
 
 void JsonFamily::Del(CmdArgList args, ConnectionContext* cntx) {
   string_view key = ArgS(args, 1);
@@ -740,6 +799,7 @@ void JsonFamily::Register(CommandRegistry* registry) {
   *registry << CI{"JSON.NUMMULTBY", CO::WRITE | CO::DENYOOM | CO::FAST, 4, 1, 1, 1}.HFUNC(
       NumMultBy);
   *registry << CI{"JSON.DEL", CO::WRITE, -2, 1, 1, 1}.HFUNC(Del);
+  *registry << CI{"JSON.OBJKEYS", CO::READONLY | CO::FAST, 3, 1, 1, 1}.HFUNC(ObjKeys);
 }
 
 }  // namespace dfly
