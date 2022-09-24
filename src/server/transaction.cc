@@ -1,4 +1,4 @@
-// Copyright 2021, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -1160,7 +1160,7 @@ bool Transaction::NotifySuspended(TxId committed_txid, ShardId sid) {
   return false;
 }
 
-void Transaction::BreakOnClose() {
+void Transaction::BreakOnShutdown() {
   if (coordinator_state_ & COORD_BLOCKED) {
     coordinator_state_ |= COORD_CANCELLED;
     blocking_ec_.notify();

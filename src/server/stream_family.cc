@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -847,7 +847,7 @@ void StreamFamily::XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext
   }
 
   if (result.status() == OpStatus::KEY_NOTFOUND) {
-    return (*cntx)->StartArray(0);
+    return (*cntx)->SendEmptyArray();
   }
   return (*cntx)->SendError(result.status());
 }

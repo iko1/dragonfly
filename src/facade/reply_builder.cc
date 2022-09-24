@@ -1,4 +1,4 @@
-// Copyright 2021, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 #include "facade/reply_builder.h"
@@ -297,6 +297,10 @@ void RedisReplyBuilder::SendSimpleStrArr(const std::string_view* arr, uint32_t c
 
 void RedisReplyBuilder::SendNullArray() {
   SendRaw("*-1\r\n");
+}
+
+void RedisReplyBuilder::SendEmptyArray() {
+  StartArray(0);
 }
 
 void RedisReplyBuilder::SendStringArr(absl::Span<const std::string_view> arr) {

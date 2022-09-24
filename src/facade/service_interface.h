@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -31,6 +31,13 @@ class ServiceInterface {
   virtual ConnectionStats* GetThreadLocalConnectionStats() = 0;
 
   virtual void ConfigureHttpHandlers(util::HttpListenerBase* base) {
+  }
+
+  virtual void OnClose(ConnectionContext* cntx) {
+  }
+
+  virtual std::string GetContextInfo(ConnectionContext* cntx) {
+    return {};
   }
 };
 

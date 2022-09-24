@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -1004,9 +1004,8 @@ error_code RdbLoader::Load(io::Source* src) {
   bc.Wait();  // wait for sentinels to report.
 
   absl::Duration dur = absl::Now() - start;
-  double seconds = double(absl::ToInt64Milliseconds(dur)) / 1000;
-  LOG(INFO) << "Done loading RDB, keys loaded: " << keys_loaded;
-  LOG(INFO) << "Loading finished after " << strings::HumanReadableElapsedTime(seconds);
+  load_time_ = double(absl::ToInt64Milliseconds(dur)) / 1000;
+  keys_loaded_ = keys_loaded;
 
   return kOk;
 }

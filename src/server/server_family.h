@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -101,6 +101,10 @@ class ServerFamily {
   journal::Journal* journal() {
     return journal_.get();
   }
+
+  void OnClose(ConnectionContext* cntx);
+
+  void BreakOnShutdown();
 
  private:
   uint32_t shard_count() const {

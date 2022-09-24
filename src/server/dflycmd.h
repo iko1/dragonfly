@@ -1,4 +1,4 @@
-// Copyright 2022, Roman Gershman.  All rights reserved.
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
 // See LICENSE for licensing terms.
 //
 
@@ -28,6 +28,11 @@ class DflyCmd {
   void Run(CmdArgList args, ConnectionContext* cntx);
 
   uint32_t AllocateSyncSession();
+
+  void OnClose(ConnectionContext* cntx);
+
+  // stops all background processes so we could exit in orderly manner.
+  void BreakOnShutdown();
 
  private:
   void HandleJournal(CmdArgList args, ConnectionContext* cntx);
