@@ -32,7 +32,6 @@ using OptBool = optional<bool>;
 using OptSizeT = optional<size_t>;
 using JsonReplaceCb = function<void(const string&, json&)>;
 using CI = CommandId;
-using StringVector = vector<string>;
 
 namespace {
 
@@ -491,14 +490,14 @@ OpResult<long> OpDel(const OpArgs& op_args, string_view key, string_view path) {
   return total_deletions;
 }
 
-OpResult<vector<StringVector>> OpObjKeys(const OpArgs& op_args, string_view key,
-                                         JsonExpression expression) {
+OpResult<vector<StringVec>> OpObjKeys(const OpArgs& op_args, string_view key,
+                                      JsonExpression expression) {
   OpResult<json> result = GetJson(op_args, key);
   if (!result) {
     return result.status();
   }
 
-  vector<StringVector> vec;
+  vector<StringVec> vec;
   auto cb = [&vec](const string_view& path, const json& val) {
     if (!val.is_object()) {
       vec.emplace_back();
@@ -535,7 +534,7 @@ void JsonFamily::ObjKeys(CmdArgList args, ConnectionContext* cntx) {
   };
 
   Transaction* trans = cntx->transaction;
-  OpResult<vector<StringVector>> result = trans->ScheduleSingleHopT(move(cb));
+  OpResult<vector<StringVec>> result = trans->ScheduleSingleHopT(move(cb));
 
   if (result) {
     (*cntx)->StartArray(result->size());

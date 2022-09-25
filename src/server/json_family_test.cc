@@ -531,6 +531,8 @@ TEST_F(JsonFamilyTest, ObjKeys) {
   resp = Run({"JSON.OBJKEYS", "json", "$.*"});
   ASSERT_THAT(resp, ArrLen(5));
   const auto& arr = resp.GetVec();
+  EXPECT_THAT(arr[0], ArgType(RespExpr::NIL_ARRAY));
+  EXPECT_THAT(arr[1].GetVec(), ElementsAre("a"));
   EXPECT_THAT(arr[2].GetVec(), ElementsAre("a", "b"));
   EXPECT_THAT(arr[3].GetVec(), ElementsAre("a", "b", "c"));
   EXPECT_THAT(arr[4], ArgType(RespExpr::NIL_ARRAY));
@@ -551,6 +553,22 @@ TEST_F(JsonFamilyTest, ObjKeys) {
   const auto& arr1 = resp.GetVec();
   EXPECT_THAT(arr1[0], ArgType(RespExpr::NIL_ARRAY));
   EXPECT_THAT(arr1[1].GetVec(), ElementsAre("b", "c"));
+
+  json = R"(
+    {"a":{}, "b":{"c":{"d": {"e": 1337}}}}
+  )";
+
+  resp = Run({"set", "json", json});
+  ASSERT_THAT(resp, "OK");
+
+  resp = Run({"JSON.OBJKEYS", "json", "$..*"});
+  ASSERT_THAT(resp, ArrLen(5));
+  const auto& arr2 = resp.GetVec();
+  EXPECT_THAT(arr2[0], ArgType(RespExpr::NIL_ARRAY));
+  EXPECT_THAT(arr2[1].GetVec(), ElementsAre("c"));
+  EXPECT_THAT(arr2[2].GetVec(), ElementsAre("d"));
+  EXPECT_THAT(arr2[3].GetVec(), ElementsAre("e"));
+  EXPECT_THAT(arr2[4], ArgType(RespExpr::NIL_ARRAY));
 }
 
 }  // namespace dfly
