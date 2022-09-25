@@ -490,6 +490,8 @@ OpResult<long> OpDel(const OpArgs& op_args, string_view key, string_view path) {
   return total_deletions;
 }
 
+// Returns a vector of string vectors,
+// keys within the same object are stored in the same string vector.
 OpResult<vector<StringVec>> OpObjKeys(const OpArgs& op_args, string_view key,
                                       JsonExpression expression) {
   OpResult<json> result = GetJson(op_args, key);
