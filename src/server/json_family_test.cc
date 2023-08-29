@@ -1016,4 +1016,49 @@ TEST_F(JsonFamilyTest, LegacyV1) {
   EXPECT_THAT(resp, absl::StrCat("[", json, "]"));
 }
 
+TEST_F(JsonFamilyTest, Merge) {
+  string json = R"({"a":"apple"})";
+
+  auto resp = Run({"JSON.SET", "json", ".", json});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.MERGE", "json", "$.b", "orange"});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"([{"a":"apple","b":"orange"}])");
+
+  resp = Run({"JSON.MERGE", "json", "$.a", "strawberry"});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"([{"a":"strawberry","b":"orange"}])");
+
+  resp = Run({"JSON.MERGE", "json", "$.b", "null"});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"([{"a":"strawberry"}])");
+
+  json = R"({"arr":[1,3,6,8]})";
+
+  resp = Run({"JSON.SET", "json", ".", json});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"({"arr":[1,3,6,8])");
+
+  resp = Run({"JSON.MERGE", "json", "$.arr", "[100,300]"});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"({"arr":[100,300])");
+
+  resp = Run({"JSON.MERGE", "json", "$", R"({"arr":[99,100],"dict":{"a":"apple","b":"orange"},"string":"hello","number":13})"});
+  EXPECT_THAT(resp, "OK");
+
+  resp = Run({"JSON.GET", "json", "$"});
+  EXPECT_EQ(resp, R"({"arr":[100,300])");
+}
+
 }  // namespace dfly

@@ -1097,6 +1097,27 @@ OpResult<bool> OpSet(const OpArgs& op_args, string_view key, string_view path,
 
 }  // namespace
 
+void JsonFamily::Merge(CmdArgList args, ConnectionContext* cntx) {
+  string_view key = ArgS(args, 0);
+  string_view path = ArgS(args, 1);
+  string_view value = ArgS(args, 2);
+  /*
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpMerge(t->GetOpArgs(shard), key, path, value);
+  };
+
+  Transaction* trans = cntx->transaction;
+  OpResult<long> result = trans->ScheduleSingleHopT(move(cb));
+
+  if (result) {
+    (*cntx)->SendSimpleString("OK");
+  } else {
+    (*cntx)->SendError(result.status());
+  }
+  */
+ (*cntx)->SendSimpleString("OK");
+}
+
 void JsonFamily::Set(CmdArgList args, ConnectionContext* cntx) {
   string_view key = ArgS(args, 0);
   string_view path = ArgS(args, 1);
@@ -1825,6 +1846,7 @@ void JsonFamily::Register(CommandRegistry* registry) {
   *registry << CI{"JSON.RESP", CO::READONLY | CO::FAST, -2, 1, 1, 1, acl::JSON}.HFUNC(Resp);
   *registry << CI{"JSON.SET", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, 1, acl::JSON}.HFUNC(
       Set);
+  *registry << CI{"JSON.MERGE", CO::WRITE | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(Merge);
 }
 
 }  // namespace dfly

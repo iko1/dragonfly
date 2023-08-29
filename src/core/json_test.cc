@@ -4,6 +4,7 @@
 
 #include <jsoncons/json.hpp>
 #include <jsoncons_ext/jsonpath/jsonpath.hpp>
+#include <jsoncons_ext/mergepatch/mergepatch.hpp>
 #include <memory_resource>
 
 #include "base/gtest.h"
@@ -133,4 +134,13 @@ TEST_F(JsonTest, JsonWithPolymorhicAllocator) {
   EXPECT_EQ("Im Westen nichts Neues", j1["store"]["book"][1]["title"].as_string());
   EXPECT_EQ(10.00, j1["store"]["book"][1]["price"].as_double());
 }
+
+TEST_F(JsonTest, Merge) {
+  json j1 = R"({"f1": {"a":1}, "f2":{"a":2}})"_json;
+  json patch = json::parse(R"({"f1": null, "f3":[2,4,6]})");
+
+  mergepatch::apply_merge_patch(j1, patch);
+  EXPECT_EQ(R"({"f2":{"a":2},"f3":[2,4,6]})"_json, j1);
+}
+
 }  // namespace dfly
